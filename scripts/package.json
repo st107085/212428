@@ -1,0 +1,15 @@
+{
+  "name": "earthquake-analysis-script",
+  "version": "1.0.0",
+  "description": "CWA API data fetching and analysis for Firebase.",
+  "main": "analyze_and_upload.js",
+  "dependencies": {
+    "firebase-admin": "^8.13.0",
+    "axios": "^0.21.1",
+    "xml2js": "^0.4.23",
+    "jszip": "^3.6.0"
+  },
+  "scripts": {
+    "start": "node analyze_and_upload.js"
+  }
+}
