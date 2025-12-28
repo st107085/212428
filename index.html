@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🇹🇼 台灣地震機率分析儀</title>
+    
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="./taiwan_counties.geojson.js"></script> 
+
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; color: #333; }
+        .container { max-width: 1200px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); }
+        h1 { color: #cc0000; border-bottom: 3px solid #eee; padding-bottom: 10px; }
+        #map { height: 600px; width: 100%; border-radius: 6px; margin-top: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05); }
+        .header-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+        .user-info { font-weight: bold; color: #007bff; }
+        .update-link { 
+            background-color: #007bff; color: white; border: none; padding: 10px 20px; 
+            border-radius: 5px; cursor: pointer; transition: background-color 0.3s; 
+            text-decoration: none; display: inline-block; text-align: center; 
+        }
+        .update-link:hover { background-color: #0056b3; }
+        .disclaimer { border: 2px solid #ffc107; background-color: #fff3cd; color: #856404; padding: 15px; margin-bottom: 20px; border-radius: 5px; font-size: 0.9em; }
+        .info-box { background-color: #e9ecef; padding: 15px; border-radius: 5px; margin-top: 15px; font-size: 0.9em; }
+        .history-list { list-style: none; padding: 0; max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; border-radius: 5px; }
+        .history-list li { padding: 5px 0; border-bottom: 1px dashed #eee; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="disclaimer">
+            <h3>⚠️ 免責聲明 (Disclaimer)</h3>
+            <p id="disclaimer-text">載入中...</p>
+        </div>
+
+        <h1>台灣地震機率分析儀 - 震度 ≥ 5弱 (範例)</h1>
+
+        <div class="header-controls">
+            <div id="auth-status">
+                <button id="google-login-btn">使用 Google 登入</button>
+            </div>
+            
+            <div id="update-info">
+                <p>數據由系統排程自動更新。若需手動強制更新，請登入後前往 GitHub Actions 頁面觸發。</p>
+            </div>
+        </div>
+
+        <div id="map"></div>
+        
+        <div class="info-box">
+            <p>最後更新時間: <span id="last-update-time">N/A</span></p>
+            <p>分析執行者: <span id="updater-name">N/A</span></p>
+            <p>顯示震度: 
+                <select id="shindo-select">
+                    <option value="5弱">5弱</option>
+                    <option value="5強">5強</option>
+                    <option value="6弱">6弱</option>
+                    <option value="6強">6強</option>
+                    <option value="7">7</option>
+                </select>
+                預測區間: 
+                <select id="period-select">
+                    <option value="1yr">1 年內</option>
+                    <option value="3yr">3 年內</option>
+                    <option value="6yr">6 年內</option>
+                    <option value="9yr">9 年內</option>
+                </select>
+            </p>
+        </div>
+        
+        <h3>📝 更新歷史紀錄 (近 10 筆)</h3>
+        <ul id="history-list" class="history-list">
+            <li>請先登入以查看歷史紀錄。</li>
+        </ul>
+
+    </div>
+
+    <script>
+        // *** 填寫你的 Firebase SDK 設定 ***
+        const firebaseConfig = {
+            apiKey: "YOUR_API_KEY", 
+            authDomain: "YOUR_AUTH_DOMAIN", 
+            projectId: "YOUR_PROJECT_ID", 
+            // ... (填寫其他配置，例如 storageBucket, appId)
+        };
+        // *** 填寫你的 GitHub 儲存庫路徑，用於手動觸發 Actions ***
+        // 格式: https://github.com/USERNAME/REPO_NAME/actions/workflows/scheduled_analysis.yml
+        const GITHUB_ACTIONS_URL = "YOUR_GITHUB_REPO_PATH/actions/workflows/scheduled_analysis.yml";
+
+
+        firebase.initializeApp(firebaseConfig);
+
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+
+        const authStatusEl = document.getElementById('auth-status');
+        const updateInfoEl = document.getElementById('update-info');
+        const lastUpdateTimeEl = document.getElementById('last-update-time');
+        const updaterNameEl = document.getElementById('updater-name');
+        const historyListEl = document.getElementById('history-list');
+        const shindoSelect = document.getElementById('shindo-select');
+        const periodSelect = document.getElementById('period-select');
+        
+        let map;
+        let geojsonLayer;
+        let latestAnalysisData = {}; 
+
+        // --- 地圖相關函式 ---
+
+        function getColor(probability) {
+            return probability > 75 ? '#800026' :
+                   probability > 50  ? '#BD0026' :
+                   probability > 30  ? '#E31A1C' :
+                   probability > 10  ? '#FC4E2A' :
+                   probability > 5   ? '#FD8D3C' :
+                   probability > 1   ? '#FEB24C' :
+                                       '#FFEDA0';
+        }
+
+        function style(feature) {
+            const shindo = shindoSelect.value;
+            const period = periodSelect.value;
+            // 縣市名稱標準化 (將臺轉為台)
+            const countyName = feature.properties.COUNTYNAME ? feature.properties.COUNTYNAME.replace('臺','台') : ''; 
+            
+            const probability = latestAnalysisData[countyName] 
+                && latestAnalysisData[countyName][shindo] 
+                && latestAnalysisData[countyName][shindo][period] 
+                ? latestAnalysisData[countyName][shindo][period] : 0;
+
+            return {
+                fillColor: getColor(probability),
+                weight: 2,
+                opacity: 1,
+                color: 'white',
+                dashArray: '3',
+                fillOpacity: 0.7
+            };
+        }
+
+        function plotResultsOnMap() {
+            if (geojsonLayer) {
+                map.removeLayer(geojsonLayer);
+            }
+            
+            function onEachFeature(feature, layer) {
+                const shindo = shindoSelect.value;
+                const period = periodSelect.value;
+                const countyName = feature.properties.COUNTYNAME ? feature.properties.COUNTYNAME.replace('臺','台') : 'N/A';
+                
+                const probability = latestAnalysisData[countyName] 
+                    && latestAnalysisData[countyName][shindo] 
+                    && latestAnalysisData[countyName][shindo][period] 
+                    ? latestAnalysisData[countyName][shindo][period] : 'N/A';
+                
+                let tooltipContent = `<b>${feature.properties.COUNTYNAME || '未知縣市'}</b><br>
+                                      震度 ${shindo}：<br>
+                                      ${period} 內發生機率: <b>${probability}%</b>`;
+
+                layer.bindTooltip(tooltipContent, { permanent: false, direction: 'auto' });
+            }
+
+            if (window.taiwanCountiesGeoJSON) {
+                geojsonLayer = L.geoJSON(window.taiwanCountiesGeoJSON, {
+                    style: style,
+                    onEachFeature: onEachFeature
+                }).addTo(map);
+
+                map.fitBounds(geojsonLayer.getBounds());
+            } 
+        }
+
+        function initMap() {
+            map = L.map('map').setView([23.6, 120.9], 8); 
+            
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            }).addTo(map);
+
+            plotResultsOnMap();
+        }
+
+        // --- Firebase 數據讀取與顯示 ---
+
+        async function fetchLatestAnalysis() {
+            // 只有登入後才能讀取 Firestore (依照你的規則設定)
+            if (!auth.currentUser) {
+                lastUpdateTimeEl.textContent = '請先登入';
+                updaterNameEl.textContent = '請先登入';
+                document.getElementById('disclaimer-text').textContent = '請先登入以讀取最新的分析結果和免責聲明。';
+                return; 
+            }
+
+            try {
+                const doc = await db.collection('analysis_results').doc('latest').get();
+                if (doc.exists) {
+                    const data = doc.data();
+                    
+                    latestAnalysisData = data.analysisData || {};
+                    
+                    lastUpdateTimeEl.textContent = data.updateTime.toDate().toLocaleString();
+                    updaterNameEl.textContent = data.updaterName;
+                    document.getElementById('disclaimer-text').textContent = data.disclaimer;
+                    
+                    plotResultsOnMap();
+                } else {
+                    lastUpdateTimeEl.textContent = '無資料';
+                    updaterNameEl.textContent = '無資料';
+                }
+            } catch (error) {
+                console.error("讀取分析結果失敗 (可能是權限問題):", error);
+                document.getElementById('disclaimer-text').textContent = '讀取數據失敗，請檢查登入狀態或 Firestore 權限。';
+            }
+        }
+        
+        async function fetchUpdateHistory() {
+             if (!auth.currentUser) {
+                historyListEl.innerHTML = '<li>請先登入以查看歷史紀錄。</li>';
+                return;
+            }
+            try {
+                const snapshot = await db.collection('update_history')
+                    .orderBy('updateTime', 'desc')
+                    .limit(10) 
+                    .get();
+
+                historyListEl.innerHTML = '';
+                if (snapshot.empty) {
+                    historyListEl.innerHTML = '<li>目前沒有更新紀錄。</li>';
+                    return;
+                }
+
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    const timeStr = data.updateTime.toDate().toLocaleString();
+                    const statusText = data.status.startsWith('SUCCESS') ? '成功' : '失敗';
+                    const statusColor = data.status.startsWith('SUCCESS') ? 'green' : 'red';
+                    
+                    const li = document.createElement('li');
+                    li.innerHTML = `<span style="color: ${statusColor};">[${statusText}]</span> ${timeStr} 由 <b>${data.updaterName}</b> 執行`;
+                    historyListEl.appendChild(li);
+                });
+
+            } catch (error) {
+                console.error("讀取歷史紀錄失敗:", error);
+                historyListEl.innerHTML = '<li>讀取歷史紀錄失敗。</li>';
+            }
+        }
+
+        // --- 登入/登出處理 ---
+
+        function signInWithGoogle() {
+            const provider = new firebase.auth.GoogleAuthProvider();
+            auth.signInWithPopup(provider)
+                .catch(error => alert(`登入失敗: ${error.message}`));
+        }
+
+        auth.onAuthStateChanged(user => {
+            // 登入狀態變化時，重新讀取所有數據
+            fetchLatestAnalysis();
+            fetchUpdateHistory();
+
+            if (user) {
+                // 已登入
+                authStatusEl.innerHTML = `
+                    <p class="user-info">
+                        你好，${user.displayName || user.email}！ 
+                        <button id="google-logout-btn">登出</button>
+                    </p>
+                `;
+                document.getElementById('google-logout-btn').addEventListener('click', () => auth.signOut());
+                
+                // 顯示手動更新的入口
+                updateInfoEl.innerHTML = `
+                    <p>數據由系統排程自動更新，上次更新者為 <b>${updaterNameEl.textContent}</b>。</p>
+                    <a href="${GITHUB_ACTIONS_URL}" target="_blank" class="update-link">
+                        手動觸發系統更新 (記錄為 GitHub 帳號貢獻)
+                    </a>
+                `;
+            } else {
+                // 未登入
+                authStatusEl.innerHTML = `<button id="google-login-btn">使用 Google 登入</button>`;
+                document.getElementById('google-login-btn').addEventListener('click', signInWithGoogle);
+                
+                // 未登入狀態，顯示一般提示
+                updateInfoEl.innerHTML = `
+                    <p>請登入以取得讀取權限並查看手動更新入口。</p>
+                `;
+            }
+        });
+
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initMap();
+            
+            shindoSelect.addEventListener('change', plotResultsOnMap);
+            periodSelect.addEventListener('change', plotResultsOnMap);
+        });
+    </script>
+</body>
+</html>
